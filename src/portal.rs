@@ -5,9 +5,11 @@
 
 use anyhow::{Context, Result};
 use ashpd::desktop::PersistMode;
-use ashpd::desktop::Session;
-use ashpd::desktop::clipboard::Clipboard;
-use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
+use ashpd::desktop::clipboard::{Clipboard, RequestClipboardOptions};
+use ashpd::desktop::remote_desktop::{
+    ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
+};
+use ashpd::desktop::{CreateSessionOptions, Session};
 use log::{debug, warn};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -15,17 +17,13 @@ use std::path::PathBuf;
 /// Portal session wrapper
 pub struct PortalSession {
     fd: RawFd,
-    pub(crate) clipboard: Clipboard<'static>,
-    pub(crate) session_proxy: Session<'static, RemoteDesktop<'static>>,
+    pub(crate) clipboard: Clipboard,
+    pub(crate) session_proxy: Session<RemoteDesktop>,
 }
 
 impl PortalSession {
     /// Create a new portal session
-    fn new(
-        fd: RawFd,
-        clipboard: Clipboard<'static>,
-        session_proxy: Session<'static, RemoteDesktop<'static>>,
-    ) -> Self {
+    fn new(fd: RawFd, clipboard: Clipboard, session_proxy: Session<RemoteDesktop>) -> Self {
         Self {
             fd,
             clipboard,
@@ -115,7 +113,7 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
 
     // Create a new session
     let session = proxy
-        .create_session()
+        .create_session(CreateSessionOptions::default())
         .await
         .context("Failed to create RemoteDesktop session")?;
 
@@ -127,13 +125,13 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
     // Read existing restore token if available
     let restore_token = read_restore_token();
 
+    let options = SelectDevicesOptions::default()
+        .set_persist_mode(Some(PersistMode::ExplicitlyRevoked))
+        .set_restore_token(restore_token.as_deref())
+        .set_devices(devices);
+
     proxy
-        .select_devices(
-            &session,
-            devices,
-            restore_token.as_deref(),       // restore_token
-            PersistMode::ExplicitlyRevoked, // persist_mode
-        )
+        .select_devices(&session, options)
         .await
         .context("Failed to select devices")?;
 
@@ -145,7 +143,7 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
         .context("Failed to create Clipboard proxy")?;
 
     clipboard
-        .request(&session)
+        .request(&session, RequestClipboardOptions::default())
         .await
         .context("Failed to request clipboard access")?;
 
@@ -153,7 +151,7 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
 
     // Start the session (use None for window identifier)
     let start_response = proxy
-        .start(&session, None)
+        .start(&session, None, StartOptions::default())
         .await
         .context("Failed to start RemoteDesktop session")?;
 
@@ -168,7 +166,7 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
 
     // Connect to the EI (Emulated Input) socket
     let owned_fd = proxy
-        .connect_to_eis(&session)
+        .connect_to_eis(&session, ConnectToEISOptions::default())
         .await
         .context("Failed to connect to EIS")?;
 
@@ -181,20 +179,5 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
     // Keep the OwnedFd alive by leaking it (the FD will be used for the duration of the program)
     std::mem::forget(owned_fd);
 
-    // Leak the proxy and session to get 'static lifetimes
-    let _proxy_static: &'static RemoteDesktop = Box::leak(Box::new(proxy));
-    let session_static = unsafe {
-        // SAFETY: We're converting the session to 'static lifetime by leaking it
-        // The session will live for the entire program duration
-        std::mem::transmute::<
-            Session<'_, RemoteDesktop<'_>>,
-            Session<'static, RemoteDesktop<'static>>,
-        >(session)
-    };
-    let clipboard_static = unsafe {
-        // SAFETY: Same as above - clipboard will live for the program duration
-        std::mem::transmute::<Clipboard<'_>, Clipboard<'static>>(clipboard)
-    };
-
-    Ok(PortalSession::new(raw_fd, clipboard_static, session_static))
+    Ok(PortalSession::new(raw_fd, clipboard, session))
 }

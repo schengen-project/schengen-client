@@ -389,9 +389,12 @@ async fn handle_client_event(
             // Claim clipboard ownership
             let mime_types = &["text/plain;charset=utf-8", "text/plain"];
             debug!("Calling set_selection with mime_types: {:?}", mime_types);
+            // FIXME: bug in ashpd 0.13.2 - missing mime types
+            // https://github.com/bilelmoussaoui/ashpd/pull/362
+            let opts = ashpd::desktop::clipboard::SetSelectionOptions::default();
             match portal_session
                 .clipboard
-                .set_selection(&portal_session.session_proxy, mime_types)
+                .set_selection(&portal_session.session_proxy, opts)
                 .await
             {
                 Ok(_) => {
