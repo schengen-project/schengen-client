@@ -17,13 +17,13 @@ use std::path::PathBuf;
 /// Portal session wrapper
 pub struct PortalSession {
     fd: RawFd,
-    pub(crate) clipboard: Clipboard,
+    pub(crate) clipboard: Option<Clipboard>,
     pub(crate) session_proxy: Session<RemoteDesktop>,
 }
 
 impl PortalSession {
     /// Create a new portal session
-    fn new(fd: RawFd, clipboard: Clipboard, session_proxy: Session<RemoteDesktop>) -> Self {
+    fn new(fd: RawFd, clipboard: Option<Clipboard>, session_proxy: Session<RemoteDesktop>) -> Self {
         Self {
             fd,
             clipboard,
@@ -138,16 +138,32 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
     debug!("Selected keyboard and pointer devices");
 
     // Create clipboard proxy and request access BEFORE starting the session
-    let clipboard = Clipboard::new()
-        .await
-        .context("Failed to create Clipboard proxy")?;
+    // Only available for RemoteDesktop version 2 or higher
+    // Try to initialize clipboard, but don't fail if it's not available
+    let clipboard = {
+        let clipboard_result = async {
+            let clipboard = Clipboard::new().await?;
+            clipboard
+                .request(&session, RequestClipboardOptions::default())
+                .await?;
+            Ok::<_, anyhow::Error>(clipboard)
+        }
+        .await;
 
-    clipboard
-        .request(&session, RequestClipboardOptions::default())
-        .await
-        .context("Failed to request clipboard access")?;
-
-    debug!("Clipboard access requested");
+        match clipboard_result {
+            Ok(clipboard) => {
+                debug!("Clipboard access requested (RemoteDesktop version 2+)");
+                Some(clipboard)
+            }
+            Err(e) => {
+                debug!(
+                    "Clipboard not available (RemoteDesktop version < 2 or error): {}",
+                    e
+                );
+                None
+            }
+        }
+    };
 
     // Start the session (use None for window identifier)
     let start_response = proxy

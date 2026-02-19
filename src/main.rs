@@ -387,22 +387,25 @@ async fn handle_client_event(
             *clipboard_data = Some(text);
 
             // Claim clipboard ownership
-            let mime_types = &["text/plain;charset=utf-8", "text/plain"];
-            debug!("Calling set_selection with mime_types: {:?}", mime_types);
-            // FIXME: bug in ashpd 0.13.2 - missing mime types
-            // https://github.com/bilelmoussaoui/ashpd/pull/362
-            let opts = ashpd::desktop::clipboard::SetSelectionOptions::default();
-            match portal_session
-                .clipboard
-                .set_selection(&portal_session.session_proxy, opts)
-                .await
-            {
-                Ok(_) => {
-                    debug!("✓ set_selection succeeded - clipboard ownership claimed");
+            if let Some(ref clipboard) = portal_session.clipboard {
+                let mime_types = &["text/plain;charset=utf-8", "text/plain"];
+                debug!("Calling set_selection with mime_types: {:?}", mime_types);
+                // FIXME: bug in ashpd 0.13.2 - missing mime types
+                // https://github.com/bilelmoussaoui/ashpd/pull/362
+                let opts = ashpd::desktop::clipboard::SetSelectionOptions::default();
+                match clipboard
+                    .set_selection(&portal_session.session_proxy, opts)
+                    .await
+                {
+                    Ok(_) => {
+                        debug!("✓ set_selection succeeded - clipboard ownership claimed");
+                    }
+                    Err(e) => {
+                        warn!("Failed to call set_selection: {}", e);
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to call set_selection: {}", e);
-                }
+            } else {
+                debug!("Clipboard not available (RemoteDesktop version < 2)");
             }
         }
 
@@ -444,27 +447,32 @@ async fn run_event_loop(
     // Store clipboard data received from Synergy (for serving when requested)
     let mut clipboard_data: Option<String> = None;
 
-    // Create clipboard monitoring stream directly from the clipboard
-    debug!("Setting up clipboard monitoring...");
-    let mut clipboard_stream = Box::pin(
-        portal_session
-            .clipboard
+    // Create clipboard monitoring streams if clipboard is available
+    let mut clipboard_stream = if let Some(ref clipboard) = portal_session.clipboard {
+        debug!("Setting up clipboard monitoring...");
+        let stream = clipboard
             .receive_selection_owner_changed()
             .await
-            .context("Failed to create clipboard stream")?,
-    );
-    debug!("✓ Clipboard monitoring ready");
+            .context("Failed to create clipboard stream")?;
+        debug!("✓ Clipboard monitoring ready");
+        Some(Box::pin(stream))
+    } else {
+        debug!("Clipboard monitoring not available (RemoteDesktop version < 2)");
+        None
+    };
 
-    // Create clipboard transfer request stream (for when someone requests our clipboard)
-    debug!("Setting up clipboard transfer monitoring...");
-    let mut clipboard_transfer_stream = Box::pin(
-        portal_session
-            .clipboard
+    let mut clipboard_transfer_stream = if let Some(ref clipboard) = portal_session.clipboard {
+        debug!("Setting up clipboard transfer monitoring...");
+        let stream = clipboard
             .receive_selection_transfer()
             .await
-            .context("Failed to create clipboard transfer stream")?,
-    );
-    debug!("✓ Clipboard transfer monitoring ready");
+            .context("Failed to create clipboard transfer stream")?;
+        debug!("✓ Clipboard transfer monitoring ready");
+        Some(Box::pin(stream))
+    } else {
+        debug!("Clipboard transfer monitoring not available (RemoteDesktop version < 2)");
+        None
+    };
 
     loop {
         tokio::select! {
@@ -511,7 +519,12 @@ async fn run_event_loop(
             }
 
             // Handle clipboard transfer requests (someone is requesting our clipboard data)
-            Some((session, mime_type, serial)) = clipboard_transfer_stream.next() => {
+            Some((session, mime_type, serial)) = async {
+                match &mut clipboard_transfer_stream {
+                    Some(stream) => stream.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 debug!("━━━ Clipboard transfer requested ━━━");
                 debug!("  mime_type: '{}'", mime_type);
                 debug!("  serial: {}", serial);
@@ -521,7 +534,8 @@ async fn run_event_loop(
                     debug!("  We have data: {} bytes", data.len());
                     debug!("Calling selection_write with transfer session and serial={}", serial);
 
-                    match portal_session.clipboard.selection_write(&session, serial).await {
+                    if let Some(ref clipboard) = portal_session.clipboard {
+                        match clipboard.selection_write(&session, serial).await {
                         Ok(owned_fd) => {
                             debug!("✓ selection_write succeeded, got fd");
                             use std::io::Write;
@@ -534,7 +548,7 @@ async fn run_event_loop(
                             match file.write_all(data.as_bytes()) {
                                 Ok(_) => {
                                     debug!("✓ Wrote data successfully");
-                                    if let Err(e) = portal_session.clipboard.selection_write_done(&session, serial, true).await {
+                                    if let Err(e) = clipboard.selection_write_done(&session, serial, true).await {
                                         warn!("Failed to call selection_write_done: {}", e);
                                     } else {
                                         debug!("✓ Clipboard transfer complete!");
@@ -542,12 +556,13 @@ async fn run_event_loop(
                                 }
                                 Err(e) => {
                                     warn!("Failed to write data to fd: {}", e);
-                                    let _ = portal_session.clipboard.selection_write_done(&session, serial, false).await;
+                                    let _ = clipboard.selection_write_done(&session, serial, false).await;
                                 }
                             }
                         }
                         Err(e) => {
                             warn!("✗ selection_write failed: {}", e);
+                        }
                         }
                     }
                 } else {
@@ -556,7 +571,12 @@ async fn run_event_loop(
             }
 
             // Handle clipboard changes
-            Some((_session, change_event)) = clipboard_stream.next() => {
+            Some((_session, change_event)) = async {
+                match &mut clipboard_stream {
+                    Some(stream) => stream.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 debug!("Clipboard selection owner changed");
 
                 // Check if we own the clipboard - if so, ignore this event
@@ -582,7 +602,8 @@ async fn run_event_loop(
                     // Read clipboard data
                     use std::io::Read;
 
-                    match portal_session.clipboard.selection_read(&portal_session.session_proxy, mime_type).await {
+                    if let Some(ref clipboard) = portal_session.clipboard {
+                        match clipboard.selection_read(&portal_session.session_proxy, mime_type).await {
                         Ok(owned_fd) => {
                             // Convert zvariant::OwnedFd → std::os::fd::OwnedFd → File
                             let std_fd: std::os::fd::OwnedFd = owned_fd.into();
@@ -632,6 +653,7 @@ async fn run_event_loop(
                         }
                         Err(e) => {
                             warn!("Failed to read clipboard: {}", e);
+                        }
                         }
                     }
                 } else {
