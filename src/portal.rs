@@ -76,11 +76,11 @@ fn write_restore_token(token: &str) {
     let token_path = get_restore_token_path();
 
     // Create parent directory if it doesn't exist
-    if let Some(parent) = token_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        warn!("Failed to create cache directory {:?}: {}", parent, e);
-        return;
+    if let Some(parent) = token_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("Failed to create cache directory {:?}: {}", parent, e);
+            return;
+        }
     }
 
     match std::fs::write(&token_path, token) {
@@ -158,10 +158,10 @@ pub async fn connect_remote_desktop() -> Result<PortalSession> {
         .context("Failed to start RemoteDesktop session")?;
 
     // Save the restore token from the start response if provided
-    if let Ok(selected_devices) = start_response.response()
-        && let Some(token) = selected_devices.restore_token()
-    {
-        write_restore_token(token);
+    if let Ok(selected_devices) = start_response.response() {
+        if let Some(token) = selected_devices.restore_token() {
+            write_restore_token(token);
+        }
     }
 
     debug!("RemoteDesktop session started, connecting to EIS");
