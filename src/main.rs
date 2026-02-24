@@ -85,6 +85,13 @@ struct Args {
     #[arg(long, value_name = "DELAY_MS[:MAX_RETRIES]", default_missing_value = "", num_args = 0..=1)]
     retry: Option<String>,
 
+    /// Reconnect to server if connection is lost after successful connection.
+    /// With no value: reconnect after 3000ms indefinitely.
+    /// With value: --reconnect=300 reconnects after 300ms indefinitely.
+    /// With colon: --reconnect=300:5 reconnects after 300ms for max 5 attempts.
+    #[arg(long, value_name = "DELAY_MS[:MAX_RETRIES]", default_missing_value = "", num_args = 0..=1)]
+    reconnect: Option<String>,
+
     /// Increase verbosity (-v for info, -vv for debug, -vvv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -116,6 +123,72 @@ impl Args {
             None => Ok(None),
             Some(s) => Ok(Some(RetryConfig::parse(s)?)),
         }
+    }
+
+    fn get_reconnect_config(&self) -> Result<Option<RetryConfig>> {
+        match &self.reconnect {
+            None => Ok(None),
+            Some(s) => Ok(Some(RetryConfig::parse(s)?)),
+        }
+    }
+}
+
+/// Connect to the Synergy server
+async fn connect_to_server(
+    args: &Args,
+    client_name: &str,
+    width: u16,
+    height: u16,
+    retry_config: Option<RetryConfig>,
+) -> Result<schengen::client::Client> {
+    // Check for systemd socket activation
+    let mut listen_fd = ListenFd::from_env();
+
+    if let Some(listener) = listen_fd.take_tcp_listener(0)? {
+        info!("Using systemd socket activation (listening on inherited socket)");
+        listener.set_nonblocking(true)?;
+        let tokio_listener = tokio::net::TcpListener::from_std(listener)?;
+
+        debug!("Waiting for incoming connection from Synergy server...");
+        let (stream, peer_addr) = tokio_listener.accept().await?;
+        debug!("✓ Accepted connection from {}", peer_addr);
+
+        // Use connect_with_stream for socket activation
+        Builder::new()
+            .name(client_name)
+            .dimensions(width, height)
+            .connect_with_stream(stream)
+            .await
+            .context("Failed to establish connection with existing stream")
+    } else if let Some(server) = &args.server {
+        // Normal mode: connect to server with schengen client's built-in retry
+        debug!("Connecting to Synergy server: {}", server);
+
+        let mut builder = Builder::new()
+            .server_addr(server)?
+            .name(client_name)
+            .dimensions(width, height);
+
+        // Map retry config to schengen API
+        if let Some(config) = retry_config {
+            builder = builder.retry_interval(Duration::from_millis(config.delay_ms));
+            if let Some(max) = config.max_retries {
+                builder = builder.retry_count(max);
+            }
+        } else {
+            // No retry - single attempt
+            builder = builder.retry_count(1);
+        }
+
+        builder
+            .connect()
+            .await
+            .context("Failed to connect to server")
+    } else {
+        Err(anyhow::anyhow!(
+            "No server address specified and no socket activation detected. \
+             Either provide a server address or run under systemd socket activation."
+        ))
     }
 }
 
@@ -220,63 +293,50 @@ async fn main() -> Result<()> {
         width, height, _x, _y
     );
 
-    // Step 4: Connect to or accept from Synergy server
-    info!("Step 4/4: Establishing Synergy connection...");
     let retry_config = args.get_retry_config()?;
-    let client = {
-        // Check for systemd socket activation
-        let mut listen_fd = ListenFd::from_env();
+    let reconnect_config = args.get_reconnect_config()?;
 
-        if let Some(listener) = listen_fd.take_tcp_listener(0)? {
-            info!("Using systemd socket activation (listening on inherited socket)");
-            listener.set_nonblocking(true)?;
-            let tokio_listener = tokio::net::TcpListener::from_std(listener)?;
+    let mut reconnect_attempt = 0;
+    loop {
+        // Step 4: Connect to or accept from Synergy server
+        info!("Step 4/4: Establishing Synergy connection...");
+        let client =
+            connect_to_server(&args, &client_name, width, height, retry_config.clone()).await?;
+        info!("All connections established successfully");
 
-            debug!("Waiting for incoming connection from Synergy server...");
-            let (stream, peer_addr) = tokio_listener.accept().await?;
-            debug!("✓ Accepted connection from {}", peer_addr);
+        // Run event loop until connection drops
+        let result = run_event_loop(client, &portal_session, &mut ei_context).await;
 
-            // Use connect_with_stream for socket activation
-            Builder::new()
-                .name(&client_name)
-                .dimensions(width, height)
-                .connect_with_stream(stream)
-                .await
-                .context("Failed to establish connection with existing stream")?
-        } else if let Some(server) = &args.server {
-            // Normal mode: connect to server with schengen client's built-in retry
-            debug!("Connecting to Synergy server: {}", server);
-
-            let mut builder = Builder::new()
-                .server_addr(server)?
-                .name(&client_name)
-                .dimensions(width, height);
-
-            // Map retry config to schengen API
-            if let Some(config) = retry_config {
-                builder = builder.retry_interval(Duration::from_millis(config.delay_ms));
-                if let Some(max) = config.max_retries {
-                    builder = builder.retry_count(max);
+        if let Some(ref config) = reconnect_config {
+            if let Some(max) = config.max_retries {
+                if reconnect_attempt >= max {
+                    warn!("Max reconnection attempts ({}) reached, exiting", max);
+                    break;
                 }
-            } else {
-                // No retry - single attempt
-                builder = builder.retry_count(1);
             }
 
-            builder
-                .connect()
-                .await
-                .context("Failed to connect to server")?
-        } else {
-            return Err(anyhow::anyhow!(
-                "No server address specified and no socket activation detected. \
-                 Either provide a server address or run under systemd socket activation."
-            ));
-        }
-    };
-    info!("All connections established successfully");
+            reconnect_attempt += 1;
+            warn!(
+                "Connection lost, reconnecting in {}ms (attempt {})...",
+                config.delay_ms, reconnect_attempt
+            );
+            tokio::time::sleep(Duration::from_millis(config.delay_ms)).await;
 
-    run_event_loop(client, portal_session, ei_context).await?;
+            // Check for errors from event loop
+            if let Err(e) = result {
+                warn!("Event loop error: {}", e);
+            }
+
+            // Continue to next iteration to reconnect
+            continue;
+        } else {
+            // No reconnect configured, exit after connection drops
+            if let Err(e) = result {
+                warn!("Event loop error: {}", e);
+            }
+            break;
+        }
+    }
 
     info!("Shutting down");
     Ok(())
@@ -437,8 +497,8 @@ async fn handle_client_event(
 /// Main event loop that handles messages from all sources
 async fn run_event_loop(
     mut client: schengen::client::Client,
-    portal_session: portal::PortalSession,
-    mut ei_context: ei::Context,
+    portal_session: &portal::PortalSession,
+    ei_context: &mut ei::Context,
 ) -> Result<()> {
     use schengen::protocol::*;
     // Track the last sequence number from CursorEntered for clipboard messages
@@ -483,8 +543,8 @@ async fn run_event_loop(
                         debug!("← Synergy event: {:?}", event);
 
                         handle_client_event(
-                            &mut ei_context,
-                            &portal_session,
+                            ei_context,
+                            portal_session,
                             &mut last_sequence,
                             &mut clipboard_data,
                             event,
@@ -676,6 +736,7 @@ mod tests {
             server: Some("127.0.0.1:24800".to_string()),
             name: None,
             retry: None,
+            reconnect: None,
             verbose: 0,
         };
         assert_eq!(args.get_log_level(), log::LevelFilter::Warn);
@@ -684,6 +745,7 @@ mod tests {
             server: Some("127.0.0.1:24800".to_string()),
             name: None,
             retry: None,
+            reconnect: None,
             verbose: 1,
         };
         assert_eq!(args.get_log_level(), log::LevelFilter::Info);
@@ -692,6 +754,7 @@ mod tests {
             server: Some("127.0.0.1:24800".to_string()),
             name: None,
             retry: None,
+            reconnect: None,
             verbose: 2,
         };
         assert_eq!(args.get_log_level(), log::LevelFilter::Debug);
@@ -700,6 +763,7 @@ mod tests {
             server: Some("127.0.0.1:24800".to_string()),
             name: None,
             retry: None,
+            reconnect: None,
             verbose: 3,
         };
         assert_eq!(args.get_log_level(), log::LevelFilter::Trace);
@@ -711,6 +775,7 @@ mod tests {
             server: Some("127.0.0.1:24800".to_string()),
             name: Some("test-client".to_string()),
             retry: None,
+            reconnect: None,
             verbose: 0,
         };
         assert_eq!(args.get_client_name().unwrap(), "test-client");
@@ -745,5 +810,59 @@ mod tests {
     #[test]
     fn test_retry_config_invalid_max() {
         assert!(RetryConfig::parse("300:abc").is_err());
+    }
+
+    #[test]
+    fn test_get_reconnect_config_none() {
+        let args = Args {
+            server: Some("127.0.0.1:24800".to_string()),
+            name: None,
+            retry: None,
+            reconnect: None,
+            verbose: 0,
+        };
+        assert!(args.get_reconnect_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_reconnect_config_default() {
+        let args = Args {
+            server: Some("127.0.0.1:24800".to_string()),
+            name: None,
+            retry: None,
+            reconnect: Some("".to_string()),
+            verbose: 0,
+        };
+        let config = args.get_reconnect_config().unwrap().unwrap();
+        assert_eq!(config.delay_ms, 3000);
+        assert_eq!(config.max_retries, None);
+    }
+
+    #[test]
+    fn test_get_reconnect_config_with_delay() {
+        let args = Args {
+            server: Some("127.0.0.1:24800".to_string()),
+            name: None,
+            retry: None,
+            reconnect: Some("500".to_string()),
+            verbose: 0,
+        };
+        let config = args.get_reconnect_config().unwrap().unwrap();
+        assert_eq!(config.delay_ms, 500);
+        assert_eq!(config.max_retries, None);
+    }
+
+    #[test]
+    fn test_get_reconnect_config_with_max_retries() {
+        let args = Args {
+            server: Some("127.0.0.1:24800".to_string()),
+            name: None,
+            retry: None,
+            reconnect: Some("1000:3".to_string()),
+            verbose: 0,
+        };
+        let config = args.get_reconnect_config().unwrap().unwrap();
+        assert_eq!(config.delay_ms, 1000);
+        assert_eq!(config.max_retries, Some(3));
     }
 }
