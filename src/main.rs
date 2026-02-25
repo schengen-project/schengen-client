@@ -244,69 +244,125 @@ async fn main() -> Result<()> {
 
     info!("Starting schengen-client as '{}'", client_name);
 
-    // We need to connect to the portal first and receive the devices. We're not
-    // guaranteed to get any, it's a potential user interaction dialog, so let'
-    // make sure we *can* actually emulate input before we connect to the server.
-    info!("Step 1/4: Connecting to RemoteDesktop portal...");
-    let portal_session = portal::connect_remote_desktop().await?;
-
-    info!("Step 2/4: Connecting to libei...");
-    let mut ei_context = ei::connect_with_fd(portal_session.ei_fd()).await?;
-
-    // Step 3: Wait for devices to be received and resumed
-    info!("Step 3/4: Waiting for EI devices...");
-    let max_wait = std::time::Duration::from_secs(10);
-    let start = std::time::Instant::now();
-    let mut devices_ready = false;
-
-    while start.elapsed() < max_wait {
-        // Process EI events to get device configuration
-        match ei_context.recv_event().await {
-            Ok(_) => {
-                let has_keyboard = ei_context.has_keyboard();
-                let has_pointer = ei_context.has_pointer();
-
-                if has_keyboard && has_pointer {
-                    devices_ready = true;
-                    break;
-                }
-                // No required devices yet, sleep a bit and try again
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-            Err(e) => {
-                warn!("EI error while waiting for devices: {}", e);
-                break;
-            }
-        }
-    }
-
-    if !devices_ready {
-        warn!(
-            "Required devices (keyboard + pointer) not ready after waiting - continuing anyway, input may not work"
-        );
-    }
-
-    // Get screen dimensions from all EI device regions
-    let (_x, _y, width, height) = ei_context.get_screen_dimensions();
-    debug!(
-        "Screen dimensions from EI devices: {}x{} at ({}, {})",
-        width, height, _x, _y
-    );
-
     let retry_config = args.get_retry_config()?;
     let reconnect_config = args.get_reconnect_config()?;
 
     let mut reconnect_attempt = 0;
+    let portal_retry_delay = Duration::from_secs(60); // 1 minute retry for portal
+
     loop {
+        // We need to connect to the portal first and receive the devices. We're not
+        // guaranteed to get any, it's a potential user interaction dialog, so let'
+        // make sure we *can* actually emulate input before we connect to the server.
+        info!("Step 1/4: Connecting to RemoteDesktop portal...");
+        let portal_session = match portal::connect_remote_desktop().await {
+            Ok(session) => session,
+            Err(e) => {
+                warn!("Failed to connect to RemoteDesktop portal: {}", e);
+                if reconnect_config.is_some() {
+                    warn!(
+                        "Retrying portal connection in {}s...",
+                        portal_retry_delay.as_secs()
+                    );
+                    tokio::time::sleep(portal_retry_delay).await;
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        info!("Step 2/4: Connecting to libei...");
+        let mut ei_context = match ei::connect_with_fd(portal_session.ei_fd()).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                warn!("Failed to connect to libei: {}", e);
+                if reconnect_config.is_some() {
+                    warn!(
+                        "Retrying portal connection in {}s...",
+                        portal_retry_delay.as_secs()
+                    );
+                    tokio::time::sleep(portal_retry_delay).await;
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        // Step 3: Wait for devices to be received and resumed
+        info!("Step 3/4: Waiting for EI devices...");
+        let max_wait = std::time::Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        let mut devices_ready = false;
+
+        while start.elapsed() < max_wait {
+            // Process EI events to get device configuration
+            match ei_context.recv_event().await {
+                Ok(_) => {
+                    let has_keyboard = ei_context.has_keyboard();
+                    let has_pointer = ei_context.has_pointer();
+
+                    if has_keyboard && has_pointer {
+                        devices_ready = true;
+                        break;
+                    }
+                    // No required devices yet, sleep a bit and try again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    warn!("EI error while waiting for devices: {}", e);
+                    break;
+                }
+            }
+        }
+
+        if !devices_ready {
+            warn!(
+                "Required devices (keyboard + pointer) not ready after waiting - continuing anyway, input may not work"
+            );
+        }
+
+        // Get screen dimensions from all EI device regions
+        let (_x, _y, width, height) = ei_context.get_screen_dimensions();
+        debug!(
+            "Screen dimensions from EI devices: {}x{} at ({}, {})",
+            width, height, _x, _y
+        );
+
         // Step 4: Connect to or accept from Synergy server
         info!("Step 4/4: Establishing Synergy connection...");
         let client =
-            connect_to_server(&args, &client_name, width, height, retry_config.clone()).await?;
+            match connect_to_server(&args, &client_name, width, height, retry_config.clone()).await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to connect to Synergy server: {}", e);
+                    if let Some(ref config) = reconnect_config {
+                        if let Some(max) = config.max_retries {
+                            if reconnect_attempt >= max {
+                                warn!("Max reconnection attempts ({}) reached, exiting", max);
+                                return Err(e);
+                            }
+                        }
+                        reconnect_attempt += 1;
+                        warn!(
+                            "Retrying in {}ms (attempt {})...",
+                            config.delay_ms, reconnect_attempt
+                        );
+                        tokio::time::sleep(Duration::from_millis(config.delay_ms)).await;
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
         info!("All connections established successfully");
 
         // Run event loop until connection drops
         let result = run_event_loop(client, &portal_session, &mut ei_context).await;
 
+        // Check if we should reconnect
         if let Some(ref config) = reconnect_config {
             if let Some(max) = config.max_retries {
                 if reconnect_attempt >= max {
@@ -315,16 +371,31 @@ async fn main() -> Result<()> {
                 }
             }
 
-            reconnect_attempt += 1;
-            warn!(
-                "Connection lost, reconnecting in {}ms (attempt {})...",
-                config.delay_ms, reconnect_attempt
-            );
-            tokio::time::sleep(Duration::from_millis(config.delay_ms)).await;
-
             // Check for errors from event loop
-            if let Err(e) = result {
+            let should_recreate_portal = if let Err(ref e) = result {
                 warn!("Event loop error: {}", e);
+                // If the error mentions EI or portal, recreate the entire session
+                let err_str = format!("{:?}", e);
+                err_str.contains("EI") || err_str.contains("ei") || err_str.contains("portal")
+            } else {
+                false
+            };
+
+            reconnect_attempt += 1;
+
+            if should_recreate_portal {
+                warn!(
+                    "Portal/EI connection lost, recreating in {}s (attempt {})...",
+                    portal_retry_delay.as_secs(),
+                    reconnect_attempt
+                );
+                tokio::time::sleep(portal_retry_delay).await;
+            } else {
+                warn!(
+                    "Connection lost, reconnecting in {}ms (attempt {})...",
+                    config.delay_ms, reconnect_attempt
+                );
+                tokio::time::sleep(Duration::from_millis(config.delay_ms)).await;
             }
 
             // Continue to next iteration to reconnect
