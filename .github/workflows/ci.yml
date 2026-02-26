@@ -17,10 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+      - name: Install rust-toolchain.toml
+        run: rustup toolchain install
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -34,11 +32,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
-          components: clippy
+      - name: Install rust-toolchain.toml
+        run: rustup toolchain install
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -52,11 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
-          components: rustfmt
+      - name: Install rust-toolchain.toml
+        run: rustup toolchain install
 
       - name: Check formatting
         run: cargo fmt --check
@@ -75,10 +67,10 @@ jobs:
           repository: schengen-project/schengen
           path: schengen
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+      - name: Install rust-toolchain.toml
+        run: |
+          cd schengen-client
+          rustup toolchain install
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
